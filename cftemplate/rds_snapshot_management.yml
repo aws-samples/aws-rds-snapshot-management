@@ -1,0 +1,549 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: A notification mechanism to manage Amazon RDS manual snapshots (Instances and Clusters)
+Parameters:
+  NotifyEmail:
+    Type: String
+    Default: email@example.com
+    Description: >-
+      Email address to recive notifiations. Please confirm the subscription sent by SNS to be able to receive email notifications
+  CodeBucket:
+    Type: String
+    Description: >-
+      Bucket name that contains the lambda functions to execute RDS manual snapshots 
+  BackupInterval:
+    Type: Number
+    Default: '24'
+    Description: Interval for backups in hours. Default is 24 hours
+  BackupSchedule:
+    Type: String
+    Default: 0 1 * * ? *
+    Description: >-
+       The default value runs once every at 1AM UTC. The format of the Backup schedule is in Cloudwatch Event cron format. More information: http://docs.aws.amazon.com/AmazonCloudWatch/latest/events/ScheduledEvents.html
+  RetentionDays:
+    Type: Number
+    Default: '7'
+    Description: Number of days to keep snapshots in retention before deleting them. Default is 7
+  LogLevel:
+    Type: String
+    Default: ERROR
+    AllowedValues:
+      - 'DEBUG'
+      - 'INFO'
+      - 'WARN'
+      - 'ERROR'
+      - 'CRITICAL'
+    Description: >-
+      Lambda functions Log level (DEBUG, INFO, WARN, ERROR, CRITICAL are valid values).
+  DeleteOldSnapshots:
+    Type: String
+    Default: 'TRUE'
+    Description: >-
+      Set to TRUE to enable deletion of snapshot based on RetentionDays. Set to FALSE to disable
+    AllowedValues:
+      - 'TRUE'
+      - 'FALSE'
+Conditions:
+  DeleteOld: !Equals 
+    - !Ref DeleteOldSnapshots
+    - 'TRUE'
+
+Resources:
+  S3SourceListBucket:
+    Type: "AWS::S3::Bucket"
+
+  DynamoDBLoggingTable:
+    Type: "AWS::DynamoDB::Table"
+    Properties:
+      AttributeDefinitions:
+        -
+          AttributeName: "Snapshot_ID"
+          AttributeType: "S"
+        -
+          AttributeName: "RDS_Name"
+          AttributeType: "S"
+      KeySchema:
+        -
+          AttributeName: "Snapshot_ID"
+          KeyType: "HASH"
+        -
+          AttributeName: "RDS_Name"
+          KeyType: "RANGE"
+      TableName: "RDS_Snapshot_Logging"
+      ProvisionedThroughput:
+        ReadCapacityUnits: "1"
+        WriteCapacityUnits: "1"
+
+  topicBackupsFailed:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      DisplayName: Backups_Failed_RDS
+      TopicName: "Backups_Failed_RDS"
+      Subscription:
+        -
+          Endpoint: !Ref NotifyEmail
+          Protocol: "email"
+  
+  RDSBackUpToolSNSTopic:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      DisplayName: "RDS_Backup_Info"
+      TopicName: "RDS_Backup_Info"
+      Subscription:
+        -
+          Endpoint: !Ref NotifyEmail
+          Protocol: "email"
+
+  snspolicySnapshotsRDS:
+    Type: 'AWS::SNS::TopicPolicy'
+    Properties:
+      Topics:
+        - !Ref topicBackupsFailed
+      PolicyDocument:
+        Version: 2008-10-17
+        Id: __default_policy_ID
+        Statement:
+          - Sid: __default_statement_ID
+            Effect: Allow
+            Principal:
+              AWS: '*'
+            Action:
+              - 'SNS:Publish'
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'AWS:SourceOwner': !Ref 'AWS::AccountId'
+
+  alarmcwBackupsFailed:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      ActionsEnabled: 'true'
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: '1'
+      MetricName: ExecutionsFailed
+      Namespace: AWS/States
+      Period: '300'
+      Statistic: Sum
+      Threshold: '1.0'
+      AlarmActions:
+        - !Ref topicBackupsFailed
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref statemachineRDSBackupTool
+
+  iampolicyRDSPermissions:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      Description: >-
+        IAM Managed Policy to allow to create and delete Snapshots for DB Instances and Clusters
+      Path: '/RDS-Backup-Tool/'
+      ManagedPolicyName: managed_policy_rds_backup_tool_rds
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'rds:CreateDBClusterSnapshot'
+              - 'rds:CreateDBSnapshot'
+              - 'rds:DeleteDBClusterSnapshot'
+              - 'rds:DeleteDBSnapshot'
+              - 'rds:DescribeDBClusters'
+              - 'rds:DescribeDBClusterSnapshotAttributes'
+              - 'rds:DescribeDBClusterSnapshots'
+              - 'rds:DescribeDBInstances'
+              - 'rds:DescribeDBSnapshotAttributes'
+              - 'rds:DescribeDBSnapshots'
+              - 'rds:ListTagsForResource'
+              - 'rds:ModifyDBClusterSnapshotAttribute'
+              - 'rds:ModifyDBSnapshotAttribute'
+            Resource: '*'
+
+  iampolicyLambdaLogs:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      Description: >-
+        IAM Managed Policy to allow Lambda to store logs in AWS CloudWatch Logs
+      Path: '/RDS-Backup-Tool/'
+      ManagedPolicyName: managed_policy_rds_backup_tool_cw_logs
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'logs:CreateLogGroup'
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+            Resource: 'arn:aws:logs:*:*:*'
+
+  iampolicyDynamoDB:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      Description: >-
+        IAM Managed Policy to allow Lambda to managed records in DynamoDB
+      Path: '/RDS-Backup-Tool/'
+      ManagedPolicyName: managed_policy_rds_backup_tool_dynamodb
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - "dynamodb:DeleteItem"
+              - "dynamodb:Scan"
+              - "dynamodb:UpdateItem"
+            Resource:
+              - !GetAtt
+                - DynamoDBLoggingTable
+                - Arn
+
+  iampolicySNSEmail:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      Description: >-
+        IAM Managed Policy to allow Lambda to push email notification to SNS
+      Path: '/RDS-Backup-Tool/'
+      ManagedPolicyName: managed_policy_rds_backup_tool_sns
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - "sns:Publish"
+            Resource: !Ref RDSBackUpToolSNSTopic
+
+  iampolicyS3:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      Description: >-
+        IAM Managed Policy to allow Lambda to Object from S3 file.
+      Path: '/RDS-Backup-Tool/'
+      ManagedPolicyName: managed_policy_rds_backup_tool_s3
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - "s3:GetObject"
+              - "s3:HeadBucket"
+            Resource:
+              - !GetAtt
+                - S3SourceListBucket
+                - Arn
+              - !Join
+                - ""
+                - - !GetAtt
+                    - S3SourceListBucket
+                    - Arn
+                  - "/*"
+              
+
+  iamroleSnapshotsRDS:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'  
+      ManagedPolicyArns:
+        - !Ref iampolicyRDSPermissions
+        - !Ref iampolicyLambdaLogs
+        - !Ref iampolicyDynamoDB
+        - !Ref iampolicySNSEmail
+        - !Ref iampolicyS3
+
+  lambdaEmailNotification:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: email_notification.zip
+      MemorySize: 128
+      Environment:
+        Variables:
+          TOPICARN: !Ref RDSBackUpToolSNSTopic
+      Description: >-
+        This Lambda Function gets records from DynamoDB after snapshtos have been taken and old snapshots deleted
+        and sends an email with a summary via SNS.
+      Role: !GetAtt 
+        - iamroleSnapshotsRDS
+        - Arn
+      Runtime: python3.6
+      Handler: lambda_function.lambda_handler
+      Timeout: 300
+
+  lambdaTakeSnapshotsRDS:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: take_snapshots_rds.zip
+      MemorySize: 512
+      Description: >-
+        This functions triggers snapshots creation for RDS instances and clusters.
+        It checks for existing snapshots following the pattern and interval specified in
+        the environment variables with the following format:
+        <dbinstancename>-snapshot-YYYY-MM-DD-HH-MM
+      Environment:
+        Variables:
+          INTERVAL: !Ref BackupInterval
+          S3BUCKET: !Ref S3SourceListBucket
+          LOG_LEVEL: !Ref LogLevel
+      Role: !GetAtt 
+        - iamroleSnapshotsRDS
+        - Arn
+      Runtime: python3.6
+      Handler: lambda_function.lambda_handler
+      Timeout: 300
+
+  lambdaDeleteOldSnapshotsRDS:
+    Type: 'AWS::Lambda::Function'
+    Condition: DeleteOld
+    Properties:
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: delete_old_snapshots_rds.zip
+      MemorySize: 512
+      Description: >-
+        This functions triggers snapshots deletion for RDS instances and clusters.
+        It checks for existing snapshots with the following tag pair:
+        CreatedBy: RDS Backup Tool
+      Environment:
+        Variables:
+          RETENTION_DAYS: !Ref RetentionDays
+          S3BUCKET: !Ref S3SourceListBucket
+          LOG_LEVEL: !Ref LogLevel
+      Role: !GetAtt 
+        - iamroleSnapshotsRDS
+        - Arn
+      Runtime: python3.6
+      Handler: lambda_function.lambda_handler
+      Timeout: 300
+
+  lambdaCheckSnapshots:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: check_snapshots.zip
+      MemorySize: 128
+      Description: >-
+        This function scans DynamoDB and checks for snapshots that are still in 'creating' state.
+        Function updates records in DynamoDB when snapshots states change.
+      Role: !GetAtt 
+        - iamroleSnapshotsRDS
+        - Arn
+      Runtime: python3.6
+      Handler: lambda_function.lambda_handler
+      Timeout: 300
+
+  iamroleStepInvocation:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+                - states.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: inline_policy_state_invocation
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'states:StartExecution'
+                  - 'lambda:InvokeFunction'
+                Resource: '*'
+
+  cwEventBackupRDS:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Description: Triggers the TakeSnapshotsRDS state machine
+      ScheduleExpression: !Join 
+        - ''
+        - - cron(
+          - !Ref BackupSchedule
+          - )
+      State: ENABLED
+      Targets:
+        - Arn: !Ref statemachineRDSBackupTool
+          Id: Target1
+          RoleArn: !GetAtt 
+            - iamroleStepInvocation
+            - Arn
+
+  statemachineRDSBackupTool:
+    Type: 'AWS::StepFunctions::StateMachine'
+    Properties:
+      RoleArn: !GetAtt 
+        - iamroleStepInvocation
+        - Arn
+      DefinitionString: !Join 
+        - ''
+        - - !Join 
+            - |+
+
+            - - '{"Comment": "Step function used by the RDS Backup tool.",'
+              - '    "StartAt": "Create Snapshots",'
+              - '    "States": {'
+              - '      "Create Snapshots": {'
+              - '        "Type": "Task",'
+              - '        "Next": "Parallel",'
+              - '        "Resource": '
+          - '"'
+          - !GetAtt
+            - lambdaTakeSnapshotsRDS
+            - Arn
+          - |-
+            "
+            ,
+          - !Join
+            - |+
+
+            - - '        "Retry": ['
+              - '          {'
+              - '            "ErrorEquals": ['
+              - '              "RDSBackupToolException"'
+              - '            ],'
+              - '            "IntervalSeconds": 120,'
+              - '            "MaxAttempts": 20,'
+              - '            "BackoffRate": 1'
+              - '          }'
+              - '        ]'
+              - '      },'
+              - '      "Parallel": {'
+              - '        "Type": "Parallel",'
+              - '        "Next": "Email Notification",'
+              - '        "Branches": ['
+              - '          {'
+              - '            "StartAt": "CheckSnapshots",'
+              - '            "States": {'
+              - '              "CheckSnapshots": {'
+              - '                "Type": "Task",'
+              - '                "Resource": '
+          - '"'
+          - !GetAtt
+            - lambdaCheckSnapshots
+            - Arn
+          - |-
+            "
+            ,
+          - !Join
+            - |+
+
+            - - '                "Retry": ['
+              - '                  {'
+              - '                    "ErrorEquals": ['
+              - '                      "RDSBackupToolException"'
+              - '                    ],'
+              - '                    "IntervalSeconds": 120,'
+              - '                    "MaxAttempts": 20,'
+              - '                    "BackoffRate": 1'
+              - '                  }'
+              - '                ],'
+              - '                "End": true'
+              - '              }'
+              - '            }'
+              - '          },'
+              - '          {'
+              - '            "StartAt": "DeleteOld",'
+              - '            "States": {'
+              - '              "DeleteOld": {'
+              - '                "Type": "Task",'
+              - '                "Resource": '
+          - '"'
+          - !If 
+            - DeleteOld
+            - !GetAtt
+              - lambdaDeleteOldSnapshotsRDS
+              - Arn
+            - !GetAtt
+              - lambdaCheckSnapshots
+              - Arn
+          - |-
+            "
+            ,
+          - !Join
+            - |+
+
+            - - '                "Retry": ['
+              - '                  {'
+              - '                    "ErrorEquals": ['
+              - '                      "RDSBackupToolException"'
+              - '                    ],'
+              - '                    "IntervalSeconds": 120,'
+              - '                    "MaxAttempts": 30,'
+              - '                    "BackoffRate": 1'
+              - '                  },'
+              - '                  {'
+              - '                    "ErrorEquals": ['
+              - '                      "States.ALL"'
+              - '                    ],'
+              - '                    "IntervalSeconds": 30,'
+              - '                    "MaxAttempts": 20,'
+              - '                    "BackoffRate": 1'
+              - '                  }'
+              - '                ],'
+              - '                "End": true'
+              - '              }'
+              - '            }'
+              - '          }'
+              - '        ]'
+              - '      },'
+              - '      "Email Notification": {'
+              - '        "Type": "Task",'
+              - '        "Resource": '
+          - '"'
+          - !GetAtt
+            - lambdaEmailNotification
+            - Arn
+          - |-
+            "
+            ,
+          - !Join
+            - |+
+
+            - - '        "Retry": ['
+              - '          {'
+              - '            "ErrorEquals": ['
+              - '              "RDSBackupToolException"'
+              - '            ],'
+              - '            "IntervalSeconds": 120,'
+              - '            "MaxAttempts": 7,'
+              - '            "BackoffRate": 1'
+              - '          },'
+              - '          {'
+              - '            "ErrorEquals": ['
+              - '              "States.ALL"'
+              - '            ],'
+              - '            "IntervalSeconds": 30,'
+              - '            "MaxAttempts": 20,'
+              - '            "BackoffRate": 1'
+              - '          }'
+              - '        ],'
+              - '        "End": true'
+              - '      }'
+              - '    }'
+              - '  }'
+
+Outputs:
+  BackupFailedTopic:
+    Description: Subscribe to this topic to receive alerts of failed backups
+    Value: !Ref topicBackupsFailed
+
+  S3SourceListBucketOutput:
+    Description: >-
+      Add the 'rds_backup_list.txt' file in this bucket that contains list of
+      RDS instances and clusters to be backed-up
+    Value: !Ref S3SourceListBucket
+
+  EmailNotificationTopic:
+    Description: Add more emails or other endpoints to this SNS topic to receive notifications
+    Value: !Ref RDSBackUpToolSNSTopic
+
+Description: RDS Backup Tool to take snapshots of RDS Instances and Clusters.
