@@ -62,7 +62,7 @@ b)	Solution is not built to work with encrypted manual snapshots
 
 #### Author - Suman Koduri
 
-**Note: Refer to [RDS tool](https://github.com/awslabs/rds-snapshot-tool) if one is looking to automate the task of creating manual snapshots, copying them into a different account and a different region, and deleting them after a specified number of days**
+**Note: Refer to this [RDS tool](https://github.com/awslabs/rds-snapshot-tool)** if one is looking to automate the task of creating manual snapshots, copying them into a different account and a different region, and deleting them after a specified number of days
 
 ## License
 
