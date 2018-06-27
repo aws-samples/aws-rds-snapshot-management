@@ -60,6 +60,8 @@ b)	Solution is not built to work with encrypted manual snapshots
    - You can see the first set of snapshots are created for the databases listed in rds_backup_list.txt file.
    - Optionally, check the CloudWatch Rules to see the Backup Schedule created as defined in Step 4. You can also review the email notification that SNS sends when the steps are completed. An example email is shown here.
 
+#### Author - Suman Koduri
+
 **Note: Refer to [RDS tool](https://github.com/awslabs/rds-snapshot-tool) if one is looking to automate the task of creating manual snapshots, copying them into a different account and a different region, and deleting them after a specified number of days**
 
 ## License
