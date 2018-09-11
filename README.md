@@ -2,7 +2,7 @@
 
 The RDS Snapshot Management tool automates the management of manual snapshotting for both Amazon RDS Instances and Aurora Clusters. This solution creates manual snapshots, deletes  old snapshots, and finally sends a summary email. The snapshot management tool allows you to specify the backup schedule (at what times and how often), retention period and works only on the exact the list of RDS Instances and Aurora Clusters specified. 
 
-**Note, this solution has few limitations -** 
+**Note, this solution has a few limitations -** 
 a)	Solution is dependent on AWS Step Functions and hence this solution is available only in Regions where AWS Step Functions are supported.
 b)	Solution is not built to work with encrypted manual snapshots
 
